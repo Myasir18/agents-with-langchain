@@ -1,10 +1,12 @@
+import logging
 import time
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from langchain_core.messages import BaseMessage
 
-from learning_companion.chain import build_chain
+from learning_companion.chain import build_chain, describe_prompt, to_history
 from learning_companion.schemas import (
     ChatMessage,
     ChatRequest,
@@ -17,6 +19,22 @@ from learning_companion.settings import Settings, get_settings
 
 app = FastAPI(title="Learning Companion")
 STARTED_AT = int(time.time())
+
+# uvicorn.error already prints INFO lines, so the development log shows up
+# in the terminal running the app without extra logging setup.
+logger = logging.getLogger("uvicorn.error")
+
+
+@app.middleware("http")
+async def log_request_size(request: Request, call_next):
+    """In development, log one short line per request: method, path, size.
+
+    Message bodies are never logged; with chat history they grow every turn.
+    """
+    if get_settings().app_env == "development":
+        body = await request.body()
+        logger.info("%s %s body=%d bytes", request.method, request.url.path, len(body))
+    return await call_next(request)
 
 
 class ApiError(Exception):
@@ -50,11 +68,24 @@ def list_models() -> dict:
     return {"object": "list", "data": data}
 
 
-def latest_user_message(messages: list[ChatMessage]) -> str | None:
-    for message in reversed(messages):
-        if message.role == "user":
-            return message.content
-    return None
+def split_conversation(messages: list[ChatMessage]) -> tuple[list[BaseMessage], str]:
+    """The earlier history and the latest user message's text.
+
+    Raises a 400 ApiError when there is no user message, or when the latest
+    one has no plain text.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            break
+    else:
+        raise ApiError(400, "The request has no user message.", "invalid_request_error")
+
+    question = messages[index].content
+    if not isinstance(question, str) or not question.strip():
+        raise ApiError(
+            400, "The latest user message has no plain text.", "invalid_request_error"
+        )
+    return to_history(messages[:index]), question
 
 
 def provider_error(exc: Exception, settings: Settings) -> ApiError:
@@ -102,12 +133,20 @@ async def chat_completions(request: ChatRequest):
             "configuration_error",
         )
 
-    question = latest_user_message(request.messages)
-    if question is None:
-        raise ApiError(400, "The request has no user message.", "invalid_request_error")
-
+    history, question = split_conversation(request.messages)
     chain = build_chain(settings)
-    inputs = {"question": question}
+    inputs = {"history": history, "question": question}
+
+    if settings.app_env == "development":
+        # Everything the client sent that did not reach the prompt: skipped
+        # roles or content, messages over the limit, or after the question.
+        ignored = len(request.messages) - len(history) - 1
+        logger.info(
+            "chat prompt: %s client_messages=%d ignored=%d",
+            describe_prompt(inputs),
+            len(request.messages),
+            ignored,
+        )
 
     if not request.stream:
         try:

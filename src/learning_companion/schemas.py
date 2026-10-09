@@ -1,14 +1,16 @@
 import json
 import time
 import uuid
-from typing import Literal
 
 from pydantic import BaseModel
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    """Any role and content are accepted; the app uses only plain-text
+    user and assistant messages and skips the rest."""
+
+    role: str
+    content: str | list | None = None
 
 
 class ChatRequest(BaseModel):
