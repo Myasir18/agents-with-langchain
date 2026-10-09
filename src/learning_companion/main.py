@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -6,7 +7,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import BaseMessage
 
-from learning_companion.chain import build_chain, describe_prompt, to_history
+from learning_companion.chain import (
+    build_chain,
+    build_study_chain,
+    describe_prompt,
+    to_history,
+)
 from learning_companion.schemas import (
     ChatMessage,
     ChatRequest,
@@ -24,17 +30,33 @@ STARTED_AT = int(time.time())
 # in the terminal running the app without extra logging setup.
 logger = logging.getLogger("uvicorn.error")
 
+# Shown above every study-helper answer, inside the normal answer text.
+STUDY_LABEL = "*Route: study helper*\n\n"
+
 
 @app.middleware("http")
-async def log_request_size(request: Request, call_next):
-    """In development, log one short line per request: method, path, size.
+async def log_request(request: Request, call_next):
+    """In development, log each request's method, path, size and JSON body.
 
-    Message bodies are never logged; with chat history they grow every turn.
+    Only the body is logged, never headers, so an Authorization key cannot
+    appear. With chat history the body grows every turn.
     """
     if get_settings().app_env == "development":
         body = await request.body()
         logger.info("%s %s body=%d bytes", request.method, request.url.path, len(body))
+        if body:
+            logger.info("payload:\n%s", format_payload(body))
     return await call_next(request)
+
+
+def format_payload(body: bytes) -> str:
+    """Pretty JSON, ASCII-escaped so any console code page can print it."""
+    try:
+        return json.dumps(json.loads(body), indent=2)
+    except ValueError:
+        return (
+            body.decode("utf-8", errors="replace").encode("ascii", "replace").decode()
+        )
 
 
 class ApiError(Exception):
@@ -85,7 +107,37 @@ def split_conversation(messages: list[ChatMessage]) -> tuple[list[BaseMessage], 
         raise ApiError(
             400, "The latest user message has no plain text.", "invalid_request_error"
         )
-    return to_history(messages[:index]), question
+    earlier = [without_study_label(message) for message in messages[:index]]
+    return to_history(earlier), question
+
+
+def without_study_label(message: ChatMessage) -> ChatMessage:
+    """An earlier assistant answer without the app's own study label, so the
+    model does not see it in history and copy it."""
+    if message.role == "assistant" and isinstance(message.content, str):
+        content = message.content.removeprefix(STUDY_LABEL)
+        return message.model_copy(update={"content": content})
+    return message
+
+
+def choose_route(question: str) -> tuple[str, str]:
+    """The app's one visible routing rule: "study" or "general", and the question.
+
+    A message whose first word is /study goes to the study helper, with the
+    marker removed. Everything else goes to general chat unchanged. Story 4.1
+    replaces this with a LangGraph route.
+    """
+    words = question.split(maxsplit=1)
+    if words[0] == "/study":
+        rest = words[1].strip() if len(words) > 1 else ""
+        if not rest:
+            raise ApiError(
+                400,
+                "Add a question after /study, for example: /study What is an API?",
+                "invalid_request_error",
+            )
+        return "study", rest
+    return "general", question
 
 
 def provider_error(exc: Exception, settings: Settings) -> ApiError:
@@ -134,7 +186,13 @@ async def chat_completions(request: ChatRequest):
         )
 
     history, question = split_conversation(request.messages)
-    chain = build_chain(settings)
+    route, question = choose_route(question)
+    if route == "study":
+        chain = build_study_chain(settings)
+        label = STUDY_LABEL
+    else:
+        chain = build_chain(settings)
+        label = ""
     inputs = {"history": history, "question": question}
 
     if settings.app_env == "development":
@@ -142,7 +200,8 @@ async def chat_completions(request: ChatRequest):
         # roles or content, messages over the limit, or after the question.
         ignored = len(request.messages) - len(history) - 1
         logger.info(
-            "chat prompt: %s client_messages=%d ignored=%d",
+            "chat prompt: route=%s %s client_messages=%d ignored=%d",
+            route,
             describe_prompt(inputs),
             len(request.messages),
             ignored,
@@ -150,7 +209,7 @@ async def chat_completions(request: ChatRequest):
 
     if not request.stream:
         try:
-            text = await chain.ainvoke(inputs)
+            text = label + await chain.ainvoke(inputs)
         except Exception as exc:
             raise provider_error(exc, settings) from exc
         return JSONResponse(completion_body(new_completion_id(), request.model, text))
@@ -163,6 +222,6 @@ async def chat_completions(request: ChatRequest):
     except Exception as exc:
         raise provider_error(exc, settings) from exc
     return StreamingResponse(
-        event_stream(request.model, first, pieces),
+        event_stream(request.model, label + first, pieces),
         media_type="text/event-stream",
     )

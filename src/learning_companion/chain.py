@@ -74,3 +74,39 @@ def build_chain(settings: Settings):
         base_url=settings.groq_api_base_url,
     )
     return prompt | model | StrOutputParser()
+
+
+# Study-helper instructions. Fixed text owned by the app, like the one above.
+STUDY_HELPER_INSTRUCTION = (
+    "You are the Learning Companion's study helper. "
+    "Explain the beginner technical concept the learner asks about in plain "
+    "language, in a few short sentences. "
+    "Add one small example only if it makes the idea clearer. "
+    "End with exactly one small suggested next learning step, on its own line "
+    'starting with "Next step:". '
+    "If you are not sure about something, say so plainly."
+)
+
+study_prompt = ChatPromptTemplate.from_messages(
+    [
+        # Part one: the study helper's own instruction (system message).
+        SystemMessage(content=STUDY_HELPER_INSTRUCTION),
+        # Part two: earlier user and assistant messages from this request.
+        MessagesPlaceholder("history"),
+        # Part three: the current user message (human message).
+        HumanMessagePromptTemplate.from_template("{question}"),
+    ]
+)
+
+
+def build_study_chain(settings: Settings):
+    """Study-helper prompt -> Groq chat model -> text output.
+
+    The chat route uses it for messages that start with /study.
+    """
+    model = ChatGroq(
+        model=settings.groq_model_name,
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_api_base_url,
+    )
+    return study_prompt | model | StrOutputParser()
