@@ -7,12 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import BaseMessage
 
-from learning_companion.chain import (
-    build_chain,
-    build_study_chain,
-    describe_prompt,
-    to_history,
-)
+from learning_companion.chain import describe_prompt, to_history
+from learning_companion.graph import EmptyStudyQuestion, build_graph, run_graph
 from learning_companion.schemas import (
     ChatMessage,
     ChatRequest,
@@ -120,26 +116,6 @@ def without_study_label(message: ChatMessage) -> ChatMessage:
     return message
 
 
-def choose_route(question: str) -> tuple[str, str]:
-    """The app's one visible routing rule: "study" or "general", and the question.
-
-    A message whose first word is /study goes to the study helper, with the
-    marker removed. Everything else goes to general chat unchanged. Story 4.1
-    replaces this with a LangGraph route.
-    """
-    words = question.split(maxsplit=1)
-    if words[0] == "/study":
-        rest = words[1].strip() if len(words) > 1 else ""
-        if not rest:
-            raise ApiError(
-                400,
-                "Add a question after /study, for example: /study What is an API?",
-                "invalid_request_error",
-            )
-        return "study", rest
-    return "general", question
-
-
 def provider_error(exc: Exception, settings: Settings) -> ApiError:
     """Turn a Groq failure into a short error that never shows the key."""
     detail = str(exc)
@@ -154,15 +130,16 @@ def provider_error(exc: Exception, settings: Settings) -> ApiError:
 
 
 async def event_stream(
-    model: str, first: str, rest: AsyncIterator[str]
+    model: str, first: str, rest: AsyncIterator[str] | None = None
 ) -> AsyncIterator[str]:
     completion_id = new_completion_id()
     created = int(time.time())
     yield chunk_event(
         completion_id, created, model, {"role": "assistant", "content": first}
     )
-    async for piece in rest:
-        yield chunk_event(completion_id, created, model, {"content": piece})
+    if rest is not None:
+        async for piece in rest:
+            yield chunk_event(completion_id, created, model, {"content": piece})
     yield chunk_event(completion_id, created, model, {}, "stop")
     yield "data: [DONE]\n\n"
 
@@ -186,42 +163,47 @@ async def chat_completions(request: ChatRequest):
         )
 
     history, question = split_conversation(request.messages)
-    route, question = choose_route(question)
-    if route == "study":
-        chain = build_study_chain(settings)
-        label = STUDY_LABEL
-    else:
-        chain = build_chain(settings)
-        label = ""
-    inputs = {"history": history, "question": question}
+    # The LangGraph workflow in graph.py: router, one answer node, then the
+    # review (at most one rewrite). It finishes before the reply starts, so a
+    # bad key or model name becomes a normal error response, not a broken
+    # stream.
+    try:
+        state, nodes = await run_graph(
+            build_graph(settings),
+            {"user_message": question, "history": history, "revision_count": 0},
+        )
+    except EmptyStudyQuestion as exc:
+        raise ApiError(400, str(exc), "invalid_request_error") from exc
+    except Exception as exc:
+        raise provider_error(exc, settings) from exc
 
     if settings.app_env == "development":
+        logger.info(
+            "graph trace: route=%s review=%s revision_count=%d nodes=%s",
+            state["route"],
+            state["review_decision"],
+            state["revision_count"],
+            "->".join(nodes),
+        )
         # Everything the client sent that did not reach the prompt: skipped
         # roles or content, messages over the limit, or after the question.
         ignored = len(request.messages) - len(history) - 1
+        inputs = {"history": state["history"], "question": state["user_message"]}
         logger.info(
             "chat prompt: route=%s %s client_messages=%d ignored=%d",
-            route,
+            state["route"],
             describe_prompt(inputs),
             len(request.messages),
             ignored,
         )
 
+    label = STUDY_LABEL if state["route"] == "study" else ""
+    text = label + state["final_answer"]
     if not request.stream:
-        try:
-            text = label + await chain.ainvoke(inputs)
-        except Exception as exc:
-            raise provider_error(exc, settings) from exc
         return JSONResponse(completion_body(new_completion_id(), request.model, text))
 
-    # Fetch the first piece before replying so a bad key or model name
-    # becomes a normal error response, not a broken stream.
-    pieces = chain.astream(inputs)
-    try:
-        first = await anext(pieces, "")
-    except Exception as exc:
-        raise provider_error(exc, settings) from exc
+    # The whole answer is ready, so it goes out as one streamed piece.
     return StreamingResponse(
-        event_stream(request.model, label + first, pieces),
+        event_stream(request.model, text),
         media_type="text/event-stream",
     )
